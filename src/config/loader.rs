@@ -388,6 +388,9 @@ mod tests {
             [miner]
             block_mode = "1s"
 
+            [storage.temporary]
+            recent_transactions_blocks = 7
+
             [storage.cache]
             account_history_cache_capacity = 30000
             slot_history_cache_capacity = 400000
@@ -593,6 +596,9 @@ mod tests {
             async_threads = 2
             blocking_threads = 32
 
+            [storage.temporary]
+            recent_transactions_blocks = 7
+
             [storage.cache]
             account_history_cache_capacity = 30000
             slot_history_cache_capacity = 400000
@@ -685,6 +691,7 @@ mod tests {
         assert_eq!(config.miner.block_mode, MinerMode::Interval(std::time::Duration::from_secs(1)));
         assert_eq!(config.exporter.async_threads, 2);
         assert_eq!(config.exporter.blocking_threads, 32);
+        assert_eq!(config.storage.temp_storage.recent_transactions_blocks, 7);
         assert_eq!(config.storage.perm_storage.rocks_path_prefix.as_deref(), Some("temp_3001"));
         assert_eq!(config.storage.perm_storage.rocks_file_descriptors_limit, 1024);
         assert_eq!(config.storage.perm_storage.rocks_cf_cache.accounts, 1000);

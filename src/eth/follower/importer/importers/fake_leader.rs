@@ -51,7 +51,8 @@ impl ImporterWorker for FakeLeaderWorker {
         }
 
         let miner_guard = self.miner.locks.mine_and_commit.lock();
-        let (mined_block, changes) = self.miner.mine_local();
+        // every early return below drops the guard, discarding the block's in-flight transactions
+        let (mined_block, changes, _in_flight) = self.miner.mine_local();
 
         let final_expected_changes = expected_changes.complete(self.storage.as_ref())?.finalize();
         let final_changes = changes.clone().finalize();

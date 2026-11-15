@@ -93,6 +93,12 @@ chain_id = 2008
 # Number of blocking threads on the exporter runtime, reserved for importer-facing requests.
 # blocking_threads = 64
 
+[storage.temporary]
+# Number of most recent mined blocks whose transaction hashes are kept in memory for fast
+# existence checks. With 0, only the pending and in-flight (finished, being saved) blocks are
+# checked. These blocks are read one by one from the permanent storage on startup. Maximum: 1000.
+# recent_transactions_blocks = 5
+
 [storage.cache]
 # Capacity of the account history cache.
 # account_history_cache_capacity = 20000

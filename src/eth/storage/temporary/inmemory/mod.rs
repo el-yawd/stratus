@@ -9,6 +9,7 @@ use crate::eth::storage::StorageError;
 use crate::eth::storage::permanent::RocksPermanentStorage;
 #[cfg(feature = "metrics")]
 use crate::eth::storage::stratus_storage::label;
+use crate::eth::storage::temporary::TemporaryStorageConfig;
 use crate::eth::storage::temporary::compute_pending_block_number;
 use crate::eth::storage::temporary::inmemory::transaction::InmemoryTransactionTemporaryStorage;
 use crate::eth::types::Account;
@@ -27,7 +28,11 @@ use crate::eth::types::UnixTime;
 #[cfg(feature = "dev")]
 use crate::eth::types::Wei;
 
+mod recent_transactions;
 mod transaction;
+
+pub use recent_transactions::DEFAULT_RECENT_TRANSACTIONS_BLOCKS;
+pub use recent_transactions::MAX_RECENT_TRANSACTIONS_BLOCKS;
 
 #[derive(Debug)]
 pub struct InMemoryTemporaryStorage {
@@ -35,18 +40,18 @@ pub struct InMemoryTemporaryStorage {
 }
 
 impl InMemoryTemporaryStorage {
-    pub fn new(block_number: BlockNumber) -> Self {
+    pub fn new(block_number: BlockNumber, config: &TemporaryStorageConfig) -> Self {
         Self {
-            transaction_storage: InmemoryTransactionTemporaryStorage::new(block_number),
+            transaction_storage: InmemoryTransactionTemporaryStorage::new(block_number, config.recent_transactions_blocks),
         }
     }
 
     /// Creates the temporary storage at the pending block number derived from the permanent
     /// storage.
-    pub fn from_perm_storage(perm_storage: &RocksPermanentStorage) -> anyhow::Result<Self> {
+    pub fn from_perm_storage(perm_storage: &RocksPermanentStorage, config: &TemporaryStorageConfig) -> anyhow::Result<Self> {
         tracing::info!("creating temporary storage");
         let pending_block_number = compute_pending_block_number(perm_storage)?;
-        Ok(Self::new(pending_block_number))
+        Ok(Self::new(pending_block_number, config))
     }
 
     pub fn read_pending_block_header(&self) -> BlockInfo {
@@ -77,6 +82,22 @@ impl InMemoryTemporaryStorage {
     #[timed(storage_read_transaction, labels(storage = label::TEMP, hit = result.is_some(), success = true))]
     pub fn read_pending_execution(&self, hash: Hash) -> Option<TransactionExecution> {
         self.transaction_storage.read_pending_execution(hash)
+    }
+
+    pub fn contains_recent_transaction(&self, hash: Hash) -> bool {
+        self.transaction_storage.contains_recent_transaction(hash)
+    }
+
+    pub fn recent_transactions_blocks(&self) -> usize {
+        self.transaction_storage.recent_transactions_blocks()
+    }
+
+    pub fn commit_recent_transactions(&self, number: BlockNumber, hashes: impl IntoIterator<Item = Hash>) {
+        self.transaction_storage.commit_recent_transactions(number, hashes);
+    }
+
+    pub fn discard_in_flight_transactions(&self, number: BlockNumber) {
+        self.transaction_storage.discard_in_flight_transactions(number);
     }
 
     pub fn read_account(&self, address: Address) -> Option<Account> {

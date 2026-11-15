@@ -19,6 +19,7 @@ use crate::eth::executor::State;
 use crate::eth::executor::TransactionExecution;
 use crate::eth::executor::types::state::Complete;
 use crate::eth::miner::MinerMode;
+use crate::eth::storage::InFlightBlockGuard;
 use crate::eth::storage::StorageError;
 use crate::eth::storage::StratusStorage;
 use crate::eth::types::Block;
@@ -244,7 +245,7 @@ impl Miner {
     /// Mines external block and external transactions.
     ///
     /// Local transactions are not allowed to be part of the block.
-    pub fn mine_external(&self, external_block: ExternalBlock) -> anyhow::Result<(Block, State<Complete>)> {
+    pub fn mine_external(&self, external_block: ExternalBlock) -> anyhow::Result<(Block, State<Complete>, InFlightBlockGuard)> {
         // track
         #[cfg(feature = "tracing")]
         let _span = info_span!("miner::mine_external", block_number = field::Empty).entered();
@@ -254,13 +255,15 @@ impl Miner {
 
         // mine block
         let (pending_block, changes) = self.storage.finish_pending_block();
+        // on a mismatch the guard is dropped with the error, discarding the block's in-flight transactions
+        let in_flight = InFlightBlockGuard::new(Arc::clone(&self.storage), pending_block.header.number);
         let mut block: Block = pending_block.into();
 
         Span::with(|s| s.rec_str("block_number", &block.header.number));
         block.apply_external(&external_block);
 
         match external_block == block {
-            true => Ok((block, changes)),
+            true => Ok((block, changes, in_flight)),
             false => Err(anyhow!(
                 "mismatching block info:\n\tlocal:\n\t\tnumber: {:?}\n\t\ttimestamp: {:?}\n\t\thash: {:?}\n\texternal:\n\t\tnumber: {:?}\n\t\ttimestamp: {:?}\n\t\thash: {:?}",
                 block.number(),
@@ -278,15 +281,17 @@ impl Miner {
     pub fn mine_local_and_commit(&self) -> anyhow::Result<(), StorageError> {
         let _mine_and_commit_lock = self.locks.mine_and_commit.lock();
 
-        let (block, changes) = self.mine_local();
+        let (block, changes, _in_flight) = self.mine_local();
         self.commit(CommitItem::Block(block), changes)
     }
 
     /// Mines local transactions.
     ///
     /// External transactions are not allowed to be part of the block.
+    ///
+    /// The returned [`InFlightBlockGuard`] must be held until the block is saved or abandoned.
     #[timed(miner_mine_local)]
-    pub fn mine_local(&self) -> (Block, State<Complete>) {
+    pub fn mine_local(&self) -> (Block, State<Complete>, InFlightBlockGuard) {
         #[cfg(feature = "tracing")]
         let _span = info_span!("miner::mine_local", block_number = field::Empty).entered();
 
@@ -296,8 +301,9 @@ impl Miner {
         // mine block
         let (block, changes) = self.storage.finish_pending_block();
         Span::with(|s| s.rec_str("block_number", &block.header.number));
+        let in_flight = InFlightBlockGuard::new(Arc::clone(&self.storage), block.header.number);
 
-        (block.into(), changes)
+        (block.into(), changes, in_flight)
     }
 
     #[timed(miner_commit, labels(item = || item.as_ref()))]
@@ -307,6 +313,7 @@ impl Miner {
             CommitItem::ReplicationBlock(block) => {
                 self.storage.set_pending_header(block.number(), block.timestamp());
                 self.storage.finish_pending_block();
+                let _in_flight = InFlightBlockGuard::new(Arc::clone(&self.storage), block.number());
                 self.commit_block(block, changes)
             }
         }
@@ -434,7 +441,8 @@ pub mod interval_miner {
             // mine
             tracing::info!(lag_us = %tick.elapsed().as_micros(), "interval mining block");
             let miner_guard = miner.locks.mine_and_commit.lock();
-            let (block, changes) = miner.mine_local();
+            // the guard lives until commit_retry returns, which only happens once the block is saved
+            let (block, changes, _in_flight) = miner.mine_local();
             commit_retry(&miner, block, changes, miner_guard);
         }
         warn_task_rx_closed(TASK_NAME);
@@ -494,5 +502,180 @@ mod interval_miner_ticker {
                 break;
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::eth::executor::State;
+
+    fn new_miner() -> (Arc<StratusStorage>, Miner) {
+        let storage = Arc::new(StratusStorage::new_test().expect("failed to build test storage"));
+        let miner = Miner::new(Arc::clone(&storage), MinerMode::External);
+        (storage, miner)
+    }
+
+    #[test]
+    fn mine_local_guard_keeps_transactions_until_saved() {
+        let (storage, miner) = new_miner();
+        let hash = Hash::new([0x11; 32]);
+        storage.save_mock_execution_with_hash(hash);
+
+        let (block, changes, in_flight) = miner.mine_local();
+        assert!(storage.transaction_exists_recent(hash), "in-flight block");
+
+        miner.commit(CommitItem::Block(block), changes).expect("commit");
+        drop(in_flight);
+        assert!(storage.transaction_exists_recent(hash), "committed block");
+    }
+
+    #[test]
+    fn mine_local_guard_dropped_before_commit_discards_transactions() {
+        let (storage, miner) = new_miner();
+        let hash = Hash::new([0x22; 32]);
+        storage.save_mock_execution_with_hash(hash);
+
+        let (_block, _changes, in_flight) = miner.mine_local();
+        drop(in_flight);
+        assert!(!storage.transaction_exists_recent(hash));
+    }
+
+    /// External block matching the pending block's timestamp, with the given number.
+    fn external_block(storage: &StratusStorage, number: crate::eth::types::BlockNumber) -> ExternalBlock {
+        let mut block: ExternalBlock = crate::utils::test_utils::fake_first();
+        block.0.header.inner.number = number.as_u64();
+        block.0.header.inner.timestamp = **storage.read_pending_block_header().timestamp;
+        block
+    }
+
+    #[test]
+    fn mine_external_keeps_transactions_of_matching_block() {
+        let (storage, miner) = new_miner();
+        let hash = Hash::new([0x44; 32]);
+        storage.save_mock_execution_with_hash(hash);
+        let external = external_block(&storage, storage.read_pending_block_header().number);
+
+        let (block, changes, in_flight) = miner.mine_external(external).expect("matching external block");
+        miner.commit(CommitItem::Block(block), changes).expect("commit");
+        drop(in_flight);
+
+        assert!(storage.transaction_exists_recent(hash));
+    }
+
+    #[test]
+    fn mine_external_mismatch_discards_transactions() {
+        let (storage, miner) = new_miner();
+        let hash = Hash::new([0x55; 32]);
+        storage.save_mock_execution_with_hash(hash);
+        let external = external_block(&storage, storage.read_pending_block_header().number.next_block_number());
+
+        let error = miner.mine_external(external).err().expect("mismatching external block must fail");
+        assert!(error.to_string().contains("mismatching block info"), "unexpected error: {error}");
+
+        assert!(!storage.transaction_exists_recent(hash), "dropped block must not be reported");
+    }
+
+    #[test]
+    fn concurrent_reader_never_misses_a_transaction_being_mined() {
+        use std::sync::atomic::Ordering;
+
+        let (storage, miner) = new_miner();
+        for round in 0..300u32 {
+            let mut bytes = [0xA0; 32];
+            bytes[..4].copy_from_slice(&round.to_be_bytes());
+            let hash = Hash::new(bytes);
+            storage.save_mock_execution_with_hash(hash);
+
+            let started = AtomicBool::new(false);
+            let done = AtomicBool::new(false);
+            let misses = std::thread::scope(|scope| {
+                let reader = scope.spawn(|| {
+                    let mut misses = 0u64;
+                    loop {
+                        let finished = done.load(Ordering::Acquire);
+                        if !storage.transaction_exists_recent(hash) {
+                            misses += 1;
+                        }
+                        started.store(true, Ordering::Release);
+                        if finished {
+                            return misses;
+                        }
+                    }
+                });
+
+                // only mine once the reader is spinning, so finish and commit race against it
+                while !started.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                let (block, changes, _in_flight) = miner.mine_local();
+                miner.commit(CommitItem::Block(block), changes).expect("commit");
+                done.store(true, Ordering::Release);
+
+                reader.join().expect("reader thread")
+            });
+
+            assert_eq!(
+                misses, 0,
+                "round {round}: transaction reported missing while moving pending -> in flight -> committed"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_an_old_guard_keeps_the_next_in_flight_block() {
+        let (storage, miner) = new_miner();
+        let first = Hash::new([0x66; 32]);
+        let second = Hash::new([0x67; 32]);
+
+        storage.save_mock_execution_with_hash(first);
+        let (block, changes, first_guard) = miner.mine_local();
+        miner.commit(CommitItem::Block(block), changes).expect("commit");
+
+        storage.save_mock_execution_with_hash(second);
+        let (_block, _changes, _second_guard) = miner.mine_local();
+
+        drop(first_guard);
+        assert!(storage.transaction_exists_recent(first), "committed block");
+        assert!(
+            storage.transaction_exists_recent(second),
+            "next in-flight block must not be discarded by an older guard"
+        );
+    }
+
+    #[test]
+    fn failed_replication_commit_does_not_index_transactions() {
+        let (leader, leader_miner) = new_miner();
+        let hash = Hash::new([0x34; 32]);
+        leader.save_mock_execution_with_hash(hash);
+        let (mut block, _, _in_flight) = leader_miner.mine_local();
+
+        // a block that skips a number fails the mined number check
+        block.header.number = block.header.number.next_block_number();
+        let (follower, follower_miner) = new_miner();
+        follower_miner
+            .commit(CommitItem::ReplicationBlock(block), State::default())
+            .expect_err("replicated block with a gap must fail");
+
+        assert!(!follower.transaction_exists_recent(hash));
+    }
+
+    #[test]
+    fn replication_commit_indexes_replicated_transactions() {
+        // the leader mines a block with a transaction
+        let (leader, leader_miner) = new_miner();
+        let hash = Hash::new([0x33; 32]);
+        leader.save_mock_execution_with_hash(hash);
+        let (block, _, _in_flight) = leader_miner.mine_local();
+
+        // a replication follower commits it without executing it
+        let (follower, follower_miner) = new_miner();
+        follower_miner
+            .commit(CommitItem::ReplicationBlock(block), State::default())
+            .expect("commit replicated block");
+
+        assert!(follower.transaction_exists_recent(hash));
     }
 }

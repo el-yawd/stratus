@@ -31,6 +31,9 @@ metrics! {
         "Time executing storage read_transaction operation."
         histogram_duration storage_read_transaction{storage, hit, success},
 
+        "Time executing storage transaction_exists_recent operation (in-memory recent transactions window)."
+        histogram_duration storage_transaction_exists_recent{hit},
+
         "Time executing storage read_block operation."
         histogram_duration storage_load_access_list{},
     },

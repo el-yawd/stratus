@@ -100,6 +100,8 @@ impl StratusStorage {
             this.reset_to_genesis()?;
         }
 
+        this.load_recent_transactions()?;
+
         Ok(this)
     }
 
@@ -262,17 +264,26 @@ impl StratusStorage {
     fn commit_changes(&self, block: Block, changes: State<Complete>) -> Result<(), StorageError> {
         let block_number = block.number();
 
+        let tx_hashes: Vec<Hash> = block.transactions.iter().map(|tx| tx.info.hash).collect();
+
         let mut guard = self.latest_state_lock.write();
         let block_info = (&block.header).into();
         self.perm.save_block(block, changes.finalize())?;
         guard.set_latest_block_info(block_info);
         self.cache.cache_account_and_slots_latest_from_changes(changes);
         self.set_mined_block_number(block_number);
+        // only now that the block is persisted its transactions enter the committed window; done under the latest
+        // state lock so committed blocks enter the window in the same order they are persisted
+        self.temp.commit_recent_transactions(block_number, tx_hashes);
         drop(guard);
 
         Ok(())
     }
 
+    /// Validates and saves a block to the permanent storage.
+    ///
+    /// A failed save does not touch the in-flight transactions of the block, because the caller may retry it: they are
+    /// discarded by the [`InFlightBlockGuard`] when the caller gives up on the block.
     pub fn save_block(&self, block: Block, changes: State<Complete>) -> Result<(), StorageError> {
         let block_number = block.number();
 
@@ -382,6 +393,34 @@ impl StratusStorage {
         self.temp
             .read_pending_execution(tx_hash)
             .map_or_else(read_perm, |tx| Ok(Some(TransactionStage::Pending(tx))))
+    }
+
+    /// Checks, using only in-memory data, whether the transaction is in:
+    /// - the pending block;
+    /// - the in-flight block (finished, being saved);
+    /// - one of the last `storage.temporary.recent_transactions_blocks` blocks successfully saved to the permanent storage.
+    ///
+    /// Transactions of a block whose save failed or that was dropped are never reported.
+    ///
+    /// `false` means the transaction is not in any of those, not that it never existed:
+    /// use [`Self::read_transaction`] for a full lookup. This is a point-in-time check, not a reservation: a
+    /// transaction still executing in the EVM is not in the pending block yet.
+    #[timed(storage_transaction_exists_recent, labels(hit = *result))]
+    pub fn transaction_exists_recent(&self, tx_hash: Hash) -> bool {
+        self.temp.contains_recent_transaction(tx_hash)
+    }
+
+    /// Fills the recent transactions window with the transactions of the last mined blocks in the permanent storage.
+    pub(super) fn load_recent_transactions(&self) -> Result<(), StorageError> {
+        let mined = self.read_mined_block_number().as_u64();
+        let first = (mined + 1).saturating_sub(self.temp.recent_transactions_blocks() as u64);
+        for number in first..=mined {
+            if let Some(block) = self.perm.read_block(BlockFilter::Number(number.into()))? {
+                self.temp
+                    .commit_recent_transactions(block.number(), block.transactions.iter().map(|tx| tx.info.hash));
+            }
+        }
+        Ok(())
     }
 
     pub fn read_logs(&self, filter: &LogFilter) -> Result<Vec<LogMessage>, StorageError> {
@@ -631,5 +670,33 @@ impl StratusStorage {
         Slot::retain_missing_keys(self, &mut slot_keys);
         self.load_accounts_to_cache(account_addresses).ok();
         self.load_slots_to_cache(slot_keys).ok();
+    }
+}
+
+/// Owns the in-flight state of a finished block until it is saved or abandoned.
+///
+/// Returned together with every block finished by the miner. Dropping it discards the block's in-flight transactions
+/// if they are still in flight, i.e. the block was not saved. After a successful save they were already moved to the
+/// committed window, so dropping it is a no-op. Because it acts on drop, early returns, `?` and cancelled futures that
+/// abandon a finished block are covered without any explicit cleanup, and a caller that keeps retrying the save keeps
+/// the transactions visible for as long as it holds the guard.
+///
+/// A panic between the permanent storage write and the commit to the window (in `commit_changes`) unwinds through the
+/// guard and discards transactions of a block that was persisted; the node is not expected to survive such a panic.
+#[must_use = "dropping the guard immediately discards the block's in-flight transactions"]
+pub struct InFlightBlockGuard {
+    storage: std::sync::Arc<StratusStorage>,
+    number: BlockNumber,
+}
+
+impl InFlightBlockGuard {
+    pub fn new(storage: std::sync::Arc<StratusStorage>, number: BlockNumber) -> Self {
+        Self { storage, number }
+    }
+}
+
+impl Drop for InFlightBlockGuard {
+    fn drop(&mut self) {
+        self.storage.temp.discard_in_flight_transactions(self.number);
     }
 }

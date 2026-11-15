@@ -41,10 +41,12 @@ impl ImporterWorker for ReexecutionWorker {
             return log_and_err!(reason = e, message);
         };
 
-        let (mined_block, changes) = match self.miner.mine_external(block) {
-            Ok((mined_block, changes)) => {
+        // held until the end of this function: if it returns early or is cancelled before the commit succeeds, the
+        // block's in-flight transactions are discarded
+        let (mined_block, changes, _in_flight) = match self.miner.mine_external(block) {
+            Ok((mined_block, changes, in_flight)) => {
                 tracing::info!(number = %mined_block.number(), "mined external block");
-                (mined_block, changes)
+                (mined_block, changes, in_flight)
             }
             Err(e) => {
                 let message = GlobalState::shutdown_from(TASK_NAME, "failed to mine external block");
